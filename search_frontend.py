@@ -1,3 +1,21 @@
+# search_frontend.py
+# ------------------------------------------------------------
+# IR Final Project Frontend (GCP-friendly)
+# Endpoints:
+#   /health
+#   /search_body    -> top 100 TFIDF + cosine (BODY)
+#   /search_title   -> ALL docs with >=1 query term in TITLE, ranked by DISTINCT matched query terms
+#   /search_anchor  -> ALL docs with >=1 query term in ANCHOR, ranked by DISTINCT matched query terms
+#   /search         -> best blend
+#   /get_pagerank   -> POST [doc_id,...] -> [pr,...]
+#   /get_pageview   -> POST [doc_id,...] -> [pv,...]
+#
+# Notes:
+# - NO caching of query->result.
+# - Local caching of GCS objects (pickles/bin shards) IS allowed.
+# - Robust to weird prefixes like "gs://<bucket>/postings_gcp_title/..." in posting_locs.
+# ------------------------------------------------------------
+
 import os
 import re
 import math
@@ -12,33 +30,47 @@ from flask import Flask, request, jsonify
 from inverted_index_gcp import InvertedIndex, MultiFileReader, TUPLE_SIZE
 
 
+# Flask
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
         super(MyFlaskApp, self).run(host=host, port=port, debug=debug, **options)
 
+
 app = MyFlaskApp(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
 
-BUCKET = os.environ.get("IR_BUCKET_NAME", "").strip()
+
+# Config
+def _env_first(*names: str, default: str = "") -> str:
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return default
+
+
+BUCKET = _env_first("IR_BUCKET_NAME", "IR_BUCKET", "IR_BUCKETNAME", default="").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 
-BODY_DIR = os.environ.get("IR_BODY_DIR", "postings_gcp")
-TITLE_DIR = os.environ.get("IR_TITLE_DIR", "postings_gcp_title")
-ANCHOR_DIR = os.environ.get("IR_ANCHOR_DIR", "postings_gcp_anchor")
+BODY_DIR = os.environ.get("IR_BODY_DIR", "postings_gcp").strip()
+TITLE_DIR = os.environ.get("IR_TITLE_DIR", "postings_gcp_title").strip()
+ANCHOR_DIR = os.environ.get("IR_ANCHOR_DIR", "postings_gcp_anchor").strip()
 
-BODY_INDEX_NAME = os.environ.get("IR_BODY_INDEX_NAME", "index")
-TITLE_INDEX_NAME = os.environ.get("IR_TITLE_INDEX_NAME", "title_index")
-ANCHOR_INDEX_NAME = os.environ.get("IR_ANCHOR_INDEX_NAME", "anchor")
+BODY_INDEX_NAME = os.environ.get("IR_BODY_INDEX_NAME", "index").strip()
+TITLE_INDEX_NAME = os.environ.get("IR_TITLE_INDEX_NAME", "title_index").strip()
+ANCHOR_INDEX_NAME = os.environ.get("IR_ANCHOR_INDEX_NAME", "anchor").strip()
 
+META_NAME = os.environ.get("IR_META_NAME", "id_title_pr_pv_dict.pkl").strip()
+ID_TITLE_NAME = os.environ.get("IR_ID_TITLE_NAME", "id_title.pkl").strip()
 
-META_NAME = os.environ.get("IR_META_NAME", "id_title_pr_pv_dict.pkl")
-ID_TITLE_NAME = os.environ.get("IR_ID_TITLE_NAME", "id_title.pkl")
+# These are the *actual* title artifacts you built / want:
+TITLE_DF_NAME = os.environ.get("IR_TITLE_DF_NAME", "title_df.pickle").strip()
+TITLE_LOCS_NAME = os.environ.get("IR_TITLE_LOCS_NAME", "title_posting_locs.pickle").strip()
 
 CACHE_DIR = Path(os.environ.get("IR_CACHE_DIR", "/tmp/ir_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 START_TIME = time.time()
-
 
 RE_WORD = re.compile(r"[\#\@\w](['\-]?\w){2,24}", re.UNICODE)
 
@@ -47,40 +79,61 @@ STOPWORDS = {
     "as", "at", "from", "this", "that", "these", "those", "be", "are", "was", "were",
     "or", "not", "but", "into", "about", "over", "after", "before", "between", "during",
 }
+
+
+def tokenize(text: str) -> List[str]:
+    if not text:
+        return []
+    tokens = [m.group().lower() for m in RE_WORD.finditer(text.lower())]
+    return [t for t in tokens if t not in STOPWORDS]
+
+
+# GCS helpers + cache w/ generation check
 def _gcs_bucket():
     from google.cloud import storage
     if not BUCKET:
-        raise RuntimeError("IR_BUCKET_NAME is empty")
+        raise RuntimeError("Bucket is empty. Set IR_BUCKET_NAME (or IR_BUCKET).")
     return storage.Client().bucket(BUCKET)
 
-def _cache_path(rel_path: str) -> Path:
-    # Keep a filesystem-safe cache key for each GCS object path
+
+def _cache_paths(rel_path: str) -> Tuple[Path, Path]:
+    # filesystem-safe key
     safe = rel_path.replace("/", "__")
-    return CACHE_DIR / safe
+    return (CACHE_DIR / safe, CACHE_DIR / (safe + ".meta"))
+
 
 def load_pickle_from_bucket(rel_path: str):
     """
-    Load a pickle object from GCS with local disk caching under /tmp (or IR_CACHE_DIR).
-    This avoids repeated downloads on subsequent requests.
+    Load a pickle from GCS with local caching.
+    Cache is invalidated when blob.generation changes.
     """
-    local = _cache_path(rel_path)
-    if local.exists() and local.stat().st_size > 0:
-        with open(local, "rb") as f:
-            return pickle.load(f)
+    local, meta = _cache_paths(rel_path)
 
     bkt = _gcs_bucket()
     blob = bkt.blob(rel_path)
     if not blob.exists():
         raise FileNotFoundError(f"Missing in bucket: gs://{BUCKET}/{rel_path}")
+
+    blob.reload()  # ensure generation/size known
+    gen = str(blob.generation)
+
+    if local.exists() and meta.exists():
+        try:
+            cached_gen = meta.read_text().strip()
+            if cached_gen == gen and local.stat().st_size > 0:
+                with open(local, "rb") as f:
+                    return pickle.load(f)
+        except Exception:
+            pass  # fallthrough to re-download
+
+    # download fresh
     blob.download_to_filename(str(local))
+    meta.write_text(gen)
     with open(local, "rb") as f:
         return pickle.load(f)
 
+
 def try_load_pickle(paths: List[str]) -> Optional[Any]:
-    """
-    Try to load the first existing pickle among a list of candidate paths.
-    Returns None if all candidates fail.
-    """
     for p in paths:
         try:
             return load_pickle_from_bucket(p)
@@ -88,55 +141,9 @@ def try_load_pickle(paths: List[str]) -> Optional[Any]:
             continue
     return None
 
-TITLE_DF = load_pickle_from_bucket(f"{TITLE_DIR}/title_df.pickle")
-TITLE_LOCS = load_pickle_from_bucket(f"{TITLE_DIR}/title_posting_locs.pickle")
 
-
-def read_posting_list_title(term: str) -> List[Tuple[int, int]]:
-    """
-    Read title posting list for a term using title_df.pickle + title_posting_locs.pickle.
-    Returns list of (doc_id, tf).
-    """
-    if not TITLE_DF or not TITLE_LOCS:
-        return []
-    df = int(TITLE_DF.get(term, 0))
-    locs = TITLE_LOCS.get(term)
-    if df <= 0 or not locs:
-        return []
-
-    locs2 = _normalize_locs(locs, TITLE_DIR)
-    n_bytes = df * TUPLE_SIZE
-    reader = _get_reader("title")
-
-    try:
-        b = reader.read(locs2, n_bytes)
-    except Exception:
-        return []
-
-    pl = []
-    for i in range(df):
-        start = i * TUPLE_SIZE
-        doc_id = int.from_bytes(b[start:start+4], "big")
-        tf = int.from_bytes(b[start+4:start+6], "big")
-        pl.append((doc_id, tf))
-    return pl
-
-
-def tokenize(text: str) -> List[str]:
-    """
-    Tokenize a free-text query using the course regex and a stopword filter.
-    No stemming is applied.
-    """
-    if not text:
-        return []
-    tokens = [m.group().lower() for m in RE_WORD.finditer(text.lower())]
-    return [t for t in tokens if t not in STOPWORDS]
-
-
+# Index loading
 def try_load_index_anyname(dir_name: str, preferred_name: str) -> Optional[InvertedIndex]:
-    """
-    Loads an InvertedIndex pickle from <dir>/<name>.pkl, trying several common names.
-    """
     candidates = []
     if preferred_name:
         candidates.append(f"{preferred_name}.pkl")
@@ -144,26 +151,30 @@ def try_load_index_anyname(dir_name: str, preferred_name: str) -> Optional[Inver
 
     paths = [str(Path(dir_name) / c) for c in candidates]
     obj = try_load_pickle(paths)
-    if isinstance(obj, InvertedIndex):
-        return obj
-    return None
+    return obj if isinstance(obj, InvertedIndex) else None
+
 
 def try_load_meta() -> Optional[dict]:
     """
-    Load the metadata mapping doc_id -> title / (title, pr, pv) from GCS.
-    Supports either the combined dict or a simpler id->title dict.
+    Load doc_id -> title/(title,pr,pv).
+    Supports being stored at root OR under CODE/ or code/.
     """
-    meta = try_load_pickle([META_NAME, ID_TITLE_NAME])
-    if isinstance(meta, dict):
-        return meta
-    return None
+    candidates = [
+        META_NAME,
+        ID_TITLE_NAME,
+        f"CODE/{META_NAME}",
+        f"CODE/{ID_TITLE_NAME}",
+        f"code/{META_NAME}",
+        f"code/{ID_TITLE_NAME}",
+    ]
+    meta = try_load_pickle(candidates)
+    return meta if isinstance(meta, dict) else None
+
 
 META = try_load_meta()
 
+
 def get_title(doc_id: int) -> str:
-    """
-    Extract a document title from META, supporting multiple storage formats.
-    """
     if not META:
         return ""
     v = META.get(doc_id)
@@ -177,10 +188,8 @@ def get_title(doc_id: int) -> str:
         return v
     return ""
 
+
 def get_pagerank_value(doc_id: int) -> float:
-    """
-    Extract a PageRank value from META if available, otherwise return 0.0.
-    """
     if not META:
         return 0.0
     v = META.get(doc_id)
@@ -198,10 +207,8 @@ def get_pagerank_value(doc_id: int) -> float:
             return 0.0
     return 0.0
 
+
 def get_pageview_value(doc_id: int) -> int:
-    """
-    Extract a pageview value from META if available, otherwise return 0.
-    """
     if not META:
         return 0
     v = META.get(doc_id)
@@ -221,18 +228,25 @@ def get_pageview_value(doc_id: int) -> int:
 
 
 BODY_INDEX = try_load_index_anyname(BODY_DIR, BODY_INDEX_NAME)
-TITLE_INDEX = try_load_index_anyname(TITLE_DIR, TITLE_INDEX_NAME)
 ANCHOR_INDEX = try_load_index_anyname(ANCHOR_DIR, ANCHOR_INDEX_NAME)
 
+# TITLE is NOT loaded as InvertedIndex here; we use df + posting_locs pickles you built:
+TITLE_LOCS = load_pickle_from_bucket(f"{TITLE_DIR}/{TITLE_LOCS_NAME}")
+TITLE_DF = load_pickle_from_bucket(f"{TITLE_DIR}/{TITLE_DF_NAME}")
+
+if not isinstance(TITLE_LOCS, dict):
+    raise RuntimeError("Bad TITLE_LOCS: expected dict from title_posting_locs.pickle")
+if not isinstance(TITLE_DF, dict):
+    raise RuntimeError("Bad TITLE_DF: expected dict term->df from title_df.pickle")
+
+
+# Readers (lazy)
 _body_reader = None
 _title_reader = None
 _anchor_reader = None
 
+
 def _get_reader(which: str) -> MultiFileReader:
-    """
-    Lazy-create and reuse a MultiFileReader per index type.
-    Reuse is important for performance (keeps connections and avoids re-init costs).
-    """
     global _body_reader, _title_reader, _anchor_reader
     if which == "body":
         if _body_reader is None:
@@ -246,32 +260,58 @@ def _get_reader(which: str) -> MultiFileReader:
         if _anchor_reader is None:
             _anchor_reader = MultiFileReader(ANCHOR_DIR, bucket_name=BUCKET)
         return _anchor_reader
-    raise ValueError("bad reader")
+    raise ValueError("bad reader type")
+
+
+def _strip_gs_prefix(fname: str) -> str:
+    """
+    Accepts:
+      - "title_000.bin"
+      - "postings_gcp_title/title_000.bin"
+      - "gs://bucket/postings_gcp_title/title_000.bin"
+      - "gs:/bucket/postings_gcp_title/title_000.bin" (weird)
+    Returns file name relative to base_dir.
+    """
+    if not isinstance(fname, str):
+        return fname
+    s = fname
+
+    # normalize weird gs:/ to gs://
+    if s.startswith("gs:/") and not s.startswith("gs://"):
+        s = "gs://" + s[len("gs:/"):]
+
+    if s.startswith("gs://"):
+        # remove "gs://bucket/"
+        parts = s.split("/", 3)
+        if len(parts) >= 4:
+            s = parts[3]  # path inside bucket
+
+    return s.lstrip("/")
+
 
 def _normalize_locs(locs: List[Tuple[str, int]], base_dir: str) -> List[Tuple[str, int]]:
-    """
-    Normalize posting locations so file names are relative to base_dir.
-    This protects against stored locs that already include the directory prefix.
-    """
     if not locs:
         return locs
-    prefix = base_dir.rstrip("/") + "/"
+    base = base_dir.strip("/")
+
     out = []
     for fname, off in locs:
-        if isinstance(fname, str) and fname.startswith(prefix):
-            out.append((fname[len(prefix):], off))
-        else:
-            out.append((fname, off))
+        f = _strip_gs_prefix(fname)
+
+        # repeatedly strip base_dir prefix if present (handles double prefixes)
+        prefix = base + "/"
+        while isinstance(f, str) and f.startswith(prefix):
+            f = f[len(prefix):]
+
+        out.append((f, int(off)))
     return out
 
+
+# Posting list readers
 def read_posting_list(index: Optional[InvertedIndex], term: str, which_reader: str, base_dir: str) -> List[Tuple[int, int]]:
-    """
-    Read and decode a posting list for a term using MultiFileReader and posting_locs.
-    Returns a list of (doc_id, tf) pairs.
-    """
     if index is None:
         return []
-    df = index.df.get(term, 0)
+    df = int(index.df.get(term, 0))
     locs = index.posting_locs.get(term)
     if df <= 0 or not locs:
         return []
@@ -288,49 +328,72 @@ def read_posting_list(index: Optional[InvertedIndex], term: str, which_reader: s
     pl = []
     for i in range(df):
         start = i * TUPLE_SIZE
-        doc_id = int.from_bytes(b[start:start+4], "big")
-        tf = int.from_bytes(b[start+4:start+6], "big")
+        doc_id = int.from_bytes(b[start:start + 4], "big")
+        tf = int.from_bytes(b[start + 4:start + 6], "big")
         pl.append((doc_id, tf))
     return pl
 
 
-def rank_title_or_anchor(index: Optional[InvertedIndex], which_reader: str, base_dir: str, query_terms: List[str]) -> List[int]:
+def read_posting_list_title(term: str) -> List[Tuple[int, int]]:
+    df = int(TITLE_DF.get(term, 0))
+    locs = TITLE_LOCS.get(term)
+    if df <= 0 or not locs:
+        return []
+
+    locs2 = _normalize_locs(locs, TITLE_DIR)
+    n_bytes = df * TUPLE_SIZE
+    reader = _get_reader("title")
+
+    try:
+        b = reader.read(locs2, n_bytes)
+    except Exception:
+        return []
+
+    pl = []
+    for i in range(df):
+        start = i * TUPLE_SIZE
+        doc_id = int.from_bytes(b[start:start + 4], "big")
+        tf = int.from_bytes(b[start + 4:start + 6], "big")
+        pl.append((doc_id, tf))
+    return pl
+
+
+# Ranking
+def rank_title_or_anchor(which: str, query_terms: List[str]) -> List[int]:
     """
-    Rank docs for title/anchor by number of distinct query terms matched.
-    For title, uses TITLE_DF + TITLE_LOCS if InvertedIndex is not available.
+    Rank by number of DISTINCT matched query terms (descending).
     """
     doc2score = defaultdict(int)
+    qset = set(query_terms)
 
-    for t in set(query_terms):
-        if which_reader == "title" and index is None:
+    if which == "title":
+        for t in qset:
             pl = read_posting_list_title(t)
-        else:
-            pl = read_posting_list(index, t, which_reader, base_dir)
-
-        if not pl:
-            continue
-        for doc_id, _tf in pl:
-            doc2score[doc_id] += 1
+            for doc_id, _tf in pl:
+                doc2score[doc_id] += 1
+    elif which == "anchor":
+        for t in qset:
+            pl = read_posting_list(ANCHOR_INDEX, t, "anchor", ANCHOR_DIR)
+            for doc_id, _tf in pl:
+                doc2score[doc_id] += 1
+    else:
+        raise ValueError("which must be title/anchor")
 
     ranked = sorted(doc2score.items(), key=lambda x: (-x[1], x[0]))
     return [doc_id for doc_id, _ in ranked]
 
+
 def rank_body_tfidf_cosine(query_terms: List[str], topk: int = 100) -> List[int]:
-    """
-    Compute a simple TF-IDF cosine-style score over body postings.
-    Uses dot product between query TF-IDF and document TF-IDF weights.
-    """
     if BODY_INDEX is None:
         return []
 
-    # Prefer META size as a proxy for corpus size; fall back to a fixed constant if unavailable
     N = len(META) if isinstance(META, dict) and len(META) > 0 else 6_000_000
 
     qcnt = Counter(query_terms)
     q_weights: Dict[str, float] = {}
 
     for t, tfq in qcnt.items():
-        df = BODY_INDEX.df.get(t, 0)
+        df = int(BODY_INDEX.df.get(t, 0))
         if df <= 0:
             continue
         idf = math.log((N + 1) / (df + 1))
@@ -345,7 +408,7 @@ def rank_body_tfidf_cosine(query_terms: List[str], topk: int = 100) -> List[int]
         pl = read_posting_list(BODY_INDEX, t, "body", BODY_DIR)
         if not pl:
             continue
-        df = BODY_INDEX.df.get(t, 1)
+        df = int(BODY_INDEX.df.get(t, 1))
         idf = math.log((N + 1) / (df + 1))
         for doc_id, tf in pl:
             wdt = (1.0 + math.log(tf)) * idf
@@ -354,18 +417,15 @@ def rank_body_tfidf_cosine(query_terms: List[str], topk: int = 100) -> List[int]
     ranked = sorted(doc2score.items(), key=lambda x: (-x[1], x[0]))[:topk]
     return [doc_id for doc_id, _ in ranked]
 
+
 def blend_search(query_terms: List[str]) -> List[int]:
-    """
-    Blend ranking signals from body/title/anchor using reciprocal-rank style contributions.
-    Weights can be tuned via environment variables.
-    """
     w_anchor = float(os.environ.get("IR_W_ANCHOR", "0.1"))
     w_body = float(os.environ.get("IR_W_BODY", "0.85"))
     w_title = float(os.environ.get("IR_W_TITLE", "0.05"))
 
     body_docs = rank_body_tfidf_cosine(query_terms, topk=100)
-    title_docs = rank_title_or_anchor(TITLE_INDEX, "title", TITLE_DIR, query_terms) if TITLE_INDEX else []
-    anchor_docs = rank_title_or_anchor(ANCHOR_INDEX, "anchor", ANCHOR_DIR, query_terms) if ANCHOR_INDEX else []
+    title_docs = rank_title_or_anchor("title", query_terms)
+    anchor_docs = rank_title_or_anchor("anchor", query_terms) if ANCHOR_INDEX else []
 
     scores = defaultdict(float)
 
@@ -380,28 +440,14 @@ def blend_search(query_terms: List[str]) -> List[int]:
     return [doc_id for doc_id, _ in ranked]
 
 
+# Routes
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
+
 @app.route("/search")
 def search():
-    ''' Returns up to a 100 of your best search results for the query. This is 
-        the place to put forward your best search engine, and you are free to
-        implement the retrieval whoever you'd like within the bound of the 
-        project requirements (efficiency, quality, etc.). That means it is up to
-        you to decide on whether to use stemming, remove stopwords, use 
-        PageRank, query expansion, etc.
-
-        To issue a query navigate to a URL like:
-         http://YOUR_SERVER_DOMAIN/search?query=hello+world
-        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-        if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of up to 100 search results, ordered from best to worst where each 
-        element is a tuple (wiki_id, title).
-    '''    
     query = request.args.get("query", "")
     if not query:
         return jsonify([])
@@ -410,25 +456,11 @@ def search():
         return jsonify([])
 
     doc_ids = blend_search(q_terms)
-    res = [(int(doc_id), get_title(int(doc_id))) for doc_id in doc_ids]
-    return jsonify(res)
+    return jsonify([(int(d), get_title(int(d))) for d in doc_ids])
+
 
 @app.route("/search_body")
 def search_body():
-    ''' Returns up to a 100 search results for the query using TFIDF AND COSINE
-        SIMILARITY OF THE BODY OF ARTICLES ONLY. DO NOT use stemming. DO USE the 
-        staff-provided tokenizer from Assignment 3 (GCP part) to do the 
-        tokenization and remove stopwords. 
-
-        To issue a query navigate to a URL like:
-         http://YOUR_SERVER_DOMAIN/search_body?query=hello+world
-        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-        if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of up to 100 search results, ordered from best to worst where each 
-        element is a tuple (wiki_id, title).
-    '''    
     query = request.args.get("query", "")
     if not query:
         return jsonify([])
@@ -437,30 +469,11 @@ def search_body():
         return jsonify([])
 
     doc_ids = rank_body_tfidf_cosine(q_terms, topk=100)
-    res = [(int(doc_id), get_title(int(doc_id))) for doc_id in doc_ids]
-    return jsonify(res)
+    return jsonify([(int(d), get_title(int(d))) for d in doc_ids])
+
 
 @app.route("/search_title")
 def search_title():
-    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
-        IN THE TITLE of articles, ordered in descending order of the NUMBER OF 
-        DISTINCT QUERY WORDS that appear in the title. DO NOT use stemming. DO 
-        USE the staff-provided tokenizer from Assignment 3 (GCP part) to do the 
-        tokenization and remove stopwords. For example, a document 
-        with a title that matches two distinct query words will be ranked before a 
-        document with a title that matches only one distinct query word, 
-        regardless of the number of times the term appeared in the title (or 
-        query). 
-
-        Test this by navigating to the a URL like:
-         http://YOUR_SERVER_DOMAIN/search_title?query=hello+world
-        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-        if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of ALL (not just top 100) search results, ordered from best to 
-        worst where each element is a tuple (wiki_id, title).
-    '''    
     query = request.args.get("query", "")
     if not query:
         return jsonify([])
@@ -468,31 +481,12 @@ def search_title():
     if not q_terms:
         return jsonify([])
 
-    doc_ids = rank_title_or_anchor(TITLE_INDEX, "title", TITLE_DIR, q_terms)
-    res = [(int(doc_id), get_title(int(doc_id))) for doc_id in doc_ids]
-    return jsonify(res)
+    doc_ids = rank_title_or_anchor("title", q_terms)
+    return jsonify([(int(d), get_title(int(d))) for d in doc_ids])
+
 
 @app.route("/search_anchor")
 def search_anchor():
-    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
-        IN THE ANCHOR TEXT of articles, ordered in descending order of the 
-        NUMBER OF QUERY WORDS that appear in anchor text linking to the page. 
-        DO NOT use stemming. DO USE the staff-provided tokenizer from Assignment 
-        3 (GCP part) to do the tokenization and remove stopwords. For example, 
-        a document with a anchor text that matches two distinct query words will 
-        be ranked before a document with anchor text that matches only one 
-        distinct query word, regardless of the number of times the term appeared 
-        in the anchor text (or query). 
-
-        Test this by navigating to the a URL like:
-         http://YOUR_SERVER_DOMAIN/search_anchor?query=hello+world
-        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-        if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of ALL (not just top 100) search results, ordered from best to 
-        worst where each element is a tuple (wiki_id, title).
-    '''    
     query = request.args.get("query", "")
     if not query:
         return jsonify([])
@@ -500,53 +494,26 @@ def search_anchor():
     if not q_terms:
         return jsonify([])
 
-    doc_ids = rank_title_or_anchor(ANCHOR_INDEX, "anchor", ANCHOR_DIR, q_terms)
-    res = [(int(doc_id), get_title(int(doc_id))) for doc_id in doc_ids]
-    return jsonify(res)
+    doc_ids = rank_title_or_anchor("anchor", q_terms)
+    return jsonify([(int(d), get_title(int(d))) for d in doc_ids])
+
 
 @app.route("/get_pagerank", methods=["POST"])
 def get_pagerank():
-    ''' Returns PageRank values for a list of provided wiki article IDs. 
-
-        Test this by issuing a POST request to a URL like:
-          http://YOUR_SERVER_DOMAIN/get_pagerank
-        with a json payload of the list of article ids. In python do:
-          import requests
-          requests.post('http://YOUR_SERVER_DOMAIN/get_pagerank', json=[1,5,8])
-        As before YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-        if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of floats:
-          list of PageRank scores that correrspond to the provided article IDs.
-    '''    
     wiki_ids = request.get_json(silent=True) or []
     if not wiki_ids:
         return jsonify([])
     return jsonify([float(get_pagerank_value(int(i))) for i in wiki_ids])
 
+
 @app.route("/get_pageview", methods=["POST"])
 def get_pageview():
-    ''' Returns the number of page views that each of the provide wiki articles
-    had in August 2021.
-
-    Test this by issuing a POST request to a URL like:
-      http://YOUR_SERVER_DOMAIN/get_pageview
-    with a json payload of the list of article ids. In python do:
-      import requests
-      requests.post('http://YOUR_SERVER_DOMAIN/get_pageview', json=[1,5,8])
-    As before YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
-    if you're using ngrok on Colab or your external IP on GCP.
-    Returns:
-    --------
-        list of ints:
-          list of page view numbers from August 2021 that correrspond to the 
-          provided list article IDs.
-    '''
     wiki_ids = request.get_json(silent=True) or []
     if not wiki_ids:
         return jsonify([])
     return jsonify([int(get_pageview_value(int(i))) for i in wiki_ids])
 
+
+# Main
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
