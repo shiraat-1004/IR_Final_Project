@@ -30,6 +30,7 @@ BODY_INDEX_NAME = os.environ.get("IR_BODY_INDEX_NAME", "index")
 TITLE_INDEX_NAME = os.environ.get("IR_TITLE_INDEX_NAME", "title_index")
 ANCHOR_INDEX_NAME = os.environ.get("IR_ANCHOR_INDEX_NAME", "anchor")
 
+
 META_NAME = os.environ.get("IR_META_NAME", "id_title_pr_pv_dict.pkl")
 ID_TITLE_NAME = os.environ.get("IR_ID_TITLE_NAME", "id_title.pkl")
 
@@ -46,18 +47,6 @@ STOPWORDS = {
     "as", "at", "from", "this", "that", "these", "those", "be", "are", "was", "were",
     "or", "not", "but", "into", "about", "over", "after", "before", "between", "during",
 }
-
-def tokenize(text: str) -> List[str]:
-    """
-    Tokenize a free-text query using the course regex and a stopword filter.
-    No stemming is applied.
-    """
-    if not text:
-        return []
-    tokens = [m.group().lower() for m in RE_WORD.finditer(text.lower())]
-    return [t for t in tokens if t not in STOPWORDS]
-
-
 def _gcs_bucket():
     from google.cloud import storage
     if not BUCKET:
@@ -98,6 +87,51 @@ def try_load_pickle(paths: List[str]) -> Optional[Any]:
         except Exception:
             continue
     return None
+
+TITLE_DF = load_pickle_from_bucket(f"{TITLE_DIR}/title_df.pickle")
+TITLE_LOCS = load_pickle_from_bucket(f"{TITLE_DIR}/title_posting_locs.pickle")
+
+
+def read_posting_list_title(term: str) -> List[Tuple[int, int]]:
+    """
+    Read title posting list for a term using title_df.pickle + title_posting_locs.pickle.
+    Returns list of (doc_id, tf).
+    """
+    if not TITLE_DF or not TITLE_LOCS:
+        return []
+    df = int(TITLE_DF.get(term, 0))
+    locs = TITLE_LOCS.get(term)
+    if df <= 0 or not locs:
+        return []
+
+    locs2 = _normalize_locs(locs, TITLE_DIR)
+    n_bytes = df * TUPLE_SIZE
+    reader = _get_reader("title")
+
+    try:
+        b = reader.read(locs2, n_bytes)
+    except Exception:
+        return []
+
+    pl = []
+    for i in range(df):
+        start = i * TUPLE_SIZE
+        doc_id = int.from_bytes(b[start:start+4], "big")
+        tf = int.from_bytes(b[start+4:start+6], "big")
+        pl.append((doc_id, tf))
+    return pl
+
+
+def tokenize(text: str) -> List[str]:
+    """
+    Tokenize a free-text query using the course regex and a stopword filter.
+    No stemming is applied.
+    """
+    if not text:
+        return []
+    tokens = [m.group().lower() for m in RE_WORD.finditer(text.lower())]
+    return [t for t in tokens if t not in STOPWORDS]
+
 
 def try_load_index_anyname(dir_name: str, preferred_name: str) -> Optional[InvertedIndex]:
     """
@@ -262,14 +296,17 @@ def read_posting_list(index: Optional[InvertedIndex], term: str, which_reader: s
 
 def rank_title_or_anchor(index: Optional[InvertedIndex], which_reader: str, base_dir: str, query_terms: List[str]) -> List[int]:
     """
-    Rank documents for title/anchor endpoints by the number of distinct matched query terms.
+    Rank docs for title/anchor by number of distinct query terms matched.
+    For title, uses TITLE_DF + TITLE_LOCS if InvertedIndex is not available.
     """
-    if index is None:
-        return []
-
     doc2score = defaultdict(int)
+
     for t in set(query_terms):
-        pl = read_posting_list(index, t, which_reader, base_dir)
+        if which_reader == "title" and index is None:
+            pl = read_posting_list_title(t)
+        else:
+            pl = read_posting_list(index, t, which_reader, base_dir)
+
         if not pl:
             continue
         for doc_id, _tf in pl:
@@ -391,7 +428,8 @@ def search_body():
     --------
         list of up to 100 search results, ordered from best to worst where each 
         element is a tuple (wiki_id, title).
-    '''    query = request.args.get("query", "")
+    '''    
+    query = request.args.get("query", "")
     if not query:
         return jsonify([])
     q_terms = tokenize(query)
@@ -422,7 +460,8 @@ def search_title():
     --------
         list of ALL (not just top 100) search results, ordered from best to 
         worst where each element is a tuple (wiki_id, title).
-    '''    query = request.args.get("query", "")
+    '''    
+    query = request.args.get("query", "")
     if not query:
         return jsonify([])
     q_terms = tokenize(query)
@@ -453,7 +492,8 @@ def search_anchor():
     --------
         list of ALL (not just top 100) search results, ordered from best to 
         worst where each element is a tuple (wiki_id, title).
-    '''    query = request.args.get("query", "")
+    '''    
+    query = request.args.get("query", "")
     if not query:
         return jsonify([])
     q_terms = tokenize(query)
@@ -479,7 +519,8 @@ def get_pagerank():
     --------
         list of floats:
           list of PageRank scores that correrspond to the provided article IDs.
-    '''    wiki_ids = request.get_json(silent=True) or []
+    '''    
+    wiki_ids = request.get_json(silent=True) or []
     if not wiki_ids:
         return jsonify([])
     return jsonify([float(get_pagerank_value(int(i))) for i in wiki_ids])
