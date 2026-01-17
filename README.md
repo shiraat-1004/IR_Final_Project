@@ -12,10 +12,13 @@ GitHub repository: https://github.com/shiraat-1004/IR_Final_Project
 ## Project Structure
 
 .
-├── search_frontend.py         # Flask application: endpoints, query processing, ranking logic  
-├── inverted_index_gcp.py      # Inverted index utilities and GCS file readers  
-├── startup_script_gcp.sh      # Startup script used for VM deployment  
-├── report.pdf                 # Final project report  
+├── search_frontend.py        # Flask application: query processing, ranking logic, REST endpoints
+├── inverted_index_gcp.py     # Inverted index implementation and GCS-based posting list readers
+├── bench_queries.py          # Evaluation script for running benchmark queries and computing metrics
+├── queries_train.json        # Benchmark queries with relevance judgments (provided dataset)
+├── startup_script_gcp.sh     # Startup script for Google Cloud VM deployment
+├── IR_Final_Project_Report.pdf  # Final project report (PDF)
+├── README.md                 # Project documentation
 
 ---
 
