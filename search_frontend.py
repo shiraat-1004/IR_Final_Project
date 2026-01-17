@@ -21,6 +21,7 @@ import re
 import math
 import pickle
 import time
+from nltk.corpus import stopwords
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -73,13 +74,23 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 START_TIME = time.time()
 
 RE_WORD = re.compile(r"[\#\@\w](['\-]?\w){2,24}", re.UNICODE)
-
-STOPWORDS = {
-    "the", "and", "is", "in", "it", "of", "to", "a", "an", "on", "for", "by", "with",
-    "as", "at", "from", "this", "that", "these", "those", "be", "are", "was", "were",
-    "or", "not", "but", "into", "about", "over", "after", "before", "between", "during",
+ENGLISH_STOPWORDS = set(stopwords.words('english'))
+CORPUS_STOPWORDS = {
+    "category", "categories",
+    "also", "external", "links",
+    "references", "see", "thumb",
+    "page", "pages",
+    "article", "articles",
+    "history", "overview",
+    "list", "lists",
+    "name", "names",
+    "used", "use",
+    "one", "two", "three",
+    "first", "second",
+    "may", "many",
+    "however", "often",
 }
-
+STOPWORDS = ENGLISH_STOPWORDS | CORPUS_STOPWORDS
 
 def tokenize(text: str) -> List[str]:
     if not text:
